@@ -13,122 +13,171 @@ M.file_order = {}
 M.modified_files = {}
 M.line_mapping = {} -- Maps virtual buffer lines to original files and line numbers
 
--- Utility function to read a file
-local function read_file(filepath)
-    local f = io.open(filepath, "r")
-    if not f then
-        vim.notify("Failed to read " .. filepath, vim.log.levels.ERROR)
-        return nil
-    end
-    local content = f:read("*a")
-    f:close()
-    return content
-end
-
--- Utility function to write to a file
-local function write_file(filepath, content)
-    local f = io.open(filepath, "w")
-    if not f then
-        vim.notify("Failed to write to " .. filepath, vim.log.levels.ERROR)
-        return
-    end
-    f:write(content)
-    f:close()
+-- Utility function to read a file asynchronously
+local function read_file_async(filepath, callback)
+    local uv = vim.loop
+    uv.fs_open(filepath, "r", 438, function(err_open, fd)
+        if err_open then
+            vim.schedule(function()
+                vim.notify("Failed to open " .. filepath .. ": " .. err_open, vim.log.levels.ERROR)
+                callback(nil)
+            end)
+            return
+        end
+        uv.fs_fstat(fd, function(err_fstat, stat)
+            if err_fstat then
+                uv.fs_close(fd)
+                vim.schedule(function()
+                    vim.notify("Failed to stat " .. filepath .. ": " .. err_fstat, vim.log.levels.ERROR)
+                    callback(nil)
+                end)
+                return
+            end
+            uv.fs_read(fd, stat.size, 0, function(err_read, data)
+                uv.fs_close(fd)
+                if err_read then
+                    vim.schedule(function()
+                        vim.notify("Failed to read " .. filepath .. ": " .. err_read, vim.log.levels.ERROR)
+                        callback(nil)
+                    end)
+                    return
+                end
+                vim.schedule(function()
+                    callback(data)
+                end)
+            end)
+        end)
+    end)
 end
 
 -- Function to parse includes and load files recursively
-local function parse_includes(filepath, parent_dir, seen_files)
+local function parse_includes_async(filepath, parent_dir, seen_files, callback)
     parent_dir = parent_dir or vim.fn.fnamemodify(filepath, ":h")
     seen_files = seen_files or {}
 
     -- Prevent circular includes
     if seen_files[filepath] then
-        vim.notify("Circular include detected: " .. filepath, vim.log.levels.ERROR)
-        return {}
+        vim.schedule(function()
+            vim.notify("Circular include detected: " .. filepath, vim.log.levels.ERROR)
+            callback({})
+        end)
+        return
     end
     seen_files[filepath] = true
 
-    local content = read_file(filepath)
-    if not content then
-        return {}
-    end
-
-    local lines = {}
-    for line in content:gmatch("([^\n]*)\n?") do
-        table.insert(lines, line)
-    end
-
-    local parsed_content = {}
-    for _, line in ipairs(lines) do
-        local include = line:match('#include%s+"([^"]+)"')
-        if include then
-            local include_path = vim.fn.fnamemodify(parent_dir .. "/" .. include, ":p")
-            if not M.files[include_path] then
-                local included_content = parse_includes(include_path, vim.fn.fnamemodify(include_path, ":h"), seen_files)
-                if included_content then
-                    M.files[include_path] = included_content
-                end
-            end
-            table.insert(parsed_content, { type = "include", path = include_path })
-        else
-            table.insert(parsed_content, { type = "line", content = line })
+    read_file_async(filepath, function(content)
+        if not content then
+            callback({})
+            return
         end
-    end
 
-    return parsed_content
+        local lines = {}
+        for line in content:gmatch("([^\n]*)\n?") do
+            table.insert(lines, line)
+        end
+
+        local parsed_content = {}
+        local i = 1
+        local function process_line()
+            local line = lines[i]
+            if not line then
+                callback(parsed_content)
+                return
+            end
+            local include = line:match('#include%s+"([^"]+)"')
+            if include then
+                local include_path = vim.fn.fnamemodify(parent_dir .. "/" .. include, ":p")
+                if not M.files[include_path] then
+                    parse_includes_async(include_path, vim.fn.fnamemodify(include_path, ":h"), seen_files, function(included_content)
+                        if included_content then
+                            M.files[include_path] = included_content
+                            table.insert(parsed_content, { type = "include", path = include_path, line = i })
+                        else
+                            table.insert(parsed_content, { type = "line", content = line, line = i })
+                        end
+                        i = i + 1
+                        process_line()
+                    end)
+                else
+                    table.insert(parsed_content, { type = "include", path = include_path, line = i })
+                    i = i + 1
+                    process_line()
+                end
+            else
+                table.insert(parsed_content, { type = "line", content = line, line = i })
+                i = i + 1
+                process_line()
+            end
+        end
+        process_line()
+    end)
 end
 
 -- Function to construct the virtual buffer content and mapping
-local function construct_virtual_content(original_filepath)
+local function construct_virtual_content_async(original_filepath, callback)
     local lines = {}
     M.line_mapping = {} -- Reset mapping
 
-    local function process_content(content, origin)
-        for _, entry in ipairs(content) do
+    local function process_content(content, origin, done)
+        local i = 1
+        local function process_entry()
+            local entry = content[i]
+            if not entry then
+                done()
+                return
+            end
             if entry.type == "include" then
                 local include_path = entry.path
                 if M.files[include_path] then
-                    -- Insert start boundary
-                    local start_marker = string.format("-- Start of %s --", vim.fn.fnamemodify(include_path, ":t"))
-                    table.insert(lines, start_marker)
-                    table.insert(M.line_mapping, { filepath = include_path, line = 0, type = "boundary" })
-
+                    -- Record start of included file
+                    local start_line_num = #lines + 1
                     -- Insert included file content
-                    for idx, included_entry in ipairs(M.files[include_path]) do
-                        if included_entry.type == "line" then
-                            table.insert(lines, included_entry.content) -- **FIXED: Insert only the string content**
-                            table.insert(M.line_mapping, { filepath = include_path, line = idx, type = "code" })
-                        end
-                    end
-
-                    -- Insert end boundary
-                    local end_marker = string.format("-- End of %s --", vim.fn.fnamemodify(include_path, ":t"))
-                    table.insert(lines, end_marker)
-                    table.insert(M.line_mapping, { filepath = include_path, line = -1, type = "boundary" })
+                    process_content(M.files[include_path], include_path, function()
+                        -- Record end of included file
+                        local end_line_num = #lines
+                        -- Set virtual text for boundaries
+                        M.boundaries = M.boundaries or {}
+                        table.insert(M.boundaries, {
+                            start_line = start_line_num,
+                            end_line = end_line_num,
+                            filepath = include_path,
+                        })
+                        i = i + 1
+                        process_entry()
+                    end)
                 else
                     -- If included file couldn't be loaded, keep the include line
-                    table.insert(lines, string.format("-- Failed to include %s --", include_path))
-                    table.insert(M.line_mapping, { filepath = original_filepath, line = 0, type = "boundary" })
+                    table.insert(lines, entry.content)
+                    table.insert(M.line_mapping, { filepath = origin, line = entry.line })
+                    i = i + 1
+                    process_entry()
                 end
             elseif entry.type == "line" then
                 table.insert(lines, entry.content)
-                table.insert(M.line_mapping, { filepath = original_filepath, line = 0, type = "code" })
+                table.insert(M.line_mapping, { filepath = origin, line = entry.line })
+                i = i + 1
+                process_entry()
+            else
+                i = i + 1
+                process_entry()
             end
         end
+        process_entry()
     end
 
-    -- Process the original file first
     if M.files[original_filepath] then
-        process_content(M.files[original_filepath], original_filepath)
+        process_content(M.files[original_filepath], original_filepath, function()
+            callback(lines)
+        end)
+    else
+        callback({})
     end
-
-    return lines
 end
 
 -- Function to create custom highlight groups
 local function create_highlight_groups()
-    -- Define a distinct highlight for boundary markers
-    vim.cmd([[highlight ClangdUnfurlBoundary guifg=#FF5555 guibg=#1e1e1e gui=bold]])
+    -- Define a distinct highlight for virtual text
+    vim.cmd([[highlight ClangdUnfurlBoundary guifg=#FF5555 guibg=NONE gui=bold]])
 end
 
 -- Function to open a virtual buffer with unfurled content
@@ -146,137 +195,116 @@ function M.open_virtual_buffer()
     M.file_order = {}
     M.modified_files = {}
     M.line_mapping = {}
+    M.boundaries = {}
 
     -- Parse includes
-    local parsed = parse_includes(filepath)
-    if not parsed then return end
-    table.insert(M.file_order, filepath)
-    M.files[filepath] = parsed
+    parse_includes_async(filepath, nil, nil, function(parsed)
+        if not parsed then return end
+        table.insert(M.file_order, filepath)
+        M.files[filepath] = parsed
 
-    -- Construct virtual content
-    local virtual_content = construct_virtual_content(filepath)
+        -- Construct virtual content
+        construct_virtual_content_async(filepath, function(virtual_content)
+            -- Create a new buffer
+            M.virtual_buffer = api.nvim_create_buf(false, true) -- [listed = false, scratch = true]
+            api.nvim_buf_set_lines(M.virtual_buffer, 0, -1, false, virtual_content)
+            api.nvim_buf_set_option(M.virtual_buffer, 'modifiable', true)
+            api.nvim_buf_set_option(M.virtual_buffer, 'filetype', 'c')
 
-    -- Create a new buffer
-    M.virtual_buffer = api.nvim_create_buf(false, true) -- [listed = false, scratch = true]
-    api.nvim_buf_set_lines(M.virtual_buffer, 0, -1, false, virtual_content)
-    api.nvim_buf_set_option(M.virtual_buffer, 'modifiable', true)
-    api.nvim_buf_set_option(M.virtual_buffer, 'filetype', 'c')
+            -- **Set the buffer's name and directory**
+            local temp_filename = vim.fn.fnamemodify(filepath, ":p:h") .. "/_unfurled_" .. vim.fn.fnamemodify(filepath, ":t")
+            api.nvim_buf_set_name(M.virtual_buffer, temp_filename)
+            api.nvim_set_current_dir(vim.fn.fnamemodify(filepath, ":p:h"))
 
-    -- Create custom highlight groups
-    create_highlight_groups()
+            -- Create custom highlight groups
+            create_highlight_groups()
 
-    -- Open the buffer in a new split window
-    vim.cmd('split')
-    local win = api.nvim_get_current_win()
-    api.nvim_win_set_buf(win, M.virtual_buffer)
+            -- Open the buffer in a new split window
+            vim.cmd('split')
+            local win = api.nvim_get_current_win()
+            api.nvim_win_set_buf(win, M.virtual_buffer)
 
-    -- Highlight boundary markers
-    for idx, mapping in ipairs(M.line_mapping) do
-        if mapping.type == "boundary" then
-            api.nvim_buf_add_highlight(M.virtual_buffer, -1, 'ClangdUnfurlBoundary', idx -1, 0, -1)
-        end
-    end
-
-    -- Set up autocmd to prevent editing boundary lines
-    api.nvim_create_autocmd({"TextChanged", "TextChangedI"}, {
-        buffer = M.virtual_buffer,
-        callback = function()
-            -- Get the current cursor position
-            local cursor = api.nvim_win_get_cursor(0)
-            local line_num = cursor[1]
-            if not M.line_mapping[line_num] then return end
-            local mapping = M.line_mapping[line_num]
-            if mapping.type == "boundary" then
-                -- Revert the change
-                local original_line = api.nvim_buf_get_lines(M.virtual_buffer, line_num -1, line_num, false)[1]
-                api.nvim_buf_set_lines(M.virtual_buffer, line_num -1, line_num, false, {original_line})
-                vim.notify("Boundary lines are read-only.", vim.log.levels.WARN)
+            -- Set virtual text for boundaries
+            local ns_id = api.nvim_create_namespace('ClangdUnfurl')
+            for _, boundary in ipairs(M.boundaries) do
+                -- Start boundary
+                api.nvim_buf_set_extmark(M.virtual_buffer, ns_id, boundary.start_line - 1, 0, {
+                    virt_text = { { "-- Start of " .. vim.fn.fnamemodify(boundary.filepath, ":t") .. " --", "ClangdUnfurlBoundary" } },
+                    virt_text_pos = 'eol',
+                })
+                -- End boundary
+                api.nvim_buf_set_extmark(M.virtual_buffer, ns_id, boundary.end_line - 1, 0, {
+                    virt_text = { { "-- End of " .. vim.fn.fnamemodify(boundary.filepath, ":t") .. " --", "ClangdUnfurlBoundary" } },
+                    virt_text_pos = 'eol',
+                })
             end
-        end
-    })
 
-    -- Set up cursor movement to skip boundary lines
-    api.nvim_create_autocmd("CursorMoved", {
-        buffer = M.virtual_buffer,
-        callback = function()
-            local cursor = api.nvim_win_get_cursor(0)
-            local line_num = cursor[1]
-            if not M.line_mapping[line_num] then return end
-            local mapping = M.line_mapping[line_num]
-            if mapping.type == "boundary" then
-                -- Move cursor to the next or previous line
-                if line_num < #M.line_mapping then
-                    api.nvim_win_set_cursor(0, {line_num +1, 0})
-                elseif line_num > 1 then
-                    api.nvim_win_set_cursor(0, {line_num -1, 0})
+            -- Set up LSP for buffer
+            local lspclients = vim.lsp.get_active_clients()
+            local clangd_client = nil
+            for _, client in pairs(lspclients) do
+                if  client.name == 'clangd' then
+                    clangd_client = client
+                    break
                 end
             end
-        end
-    })
-
-    -- Optional: Make boundary lines non-selectable via mappings
-    -- Further enhancements can be done here
-end
-
--- Function to map virtual buffer lines to original files
-local function map_line_to_file(line_num)
-    if not M.line_mapping[line_num] then
-        return nil, nil
-    end
-    local mapping = M.line_mapping[line_num]
-    if mapping.type == "boundary" then
-        return nil, nil
-    elseif mapping.type == "code" then
-        return mapping.filepath, mapping.line
-    end
-    return nil, nil
-end
-
--- Function to handle buffer changes
-local function on_virtual_buf_change(buf, changedtick)
-    -- Retrieve all changed lines
-    -- This is a simplified approach; for better performance, consider tracking changes more granularly
-    local changed_lines = {}
-    for line_num, mapping in ipairs(M.line_mapping) do
-        local line = api.nvim_buf_get_lines(buf, line_num -1, line_num, false)[1]
-        if mapping.type == "code" then
-            changed_lines[line_num] = line
-            -- Map the change back to the original file
-            if not M.modified_files[mapping.filepath] then
-                M.modified_files[mapping.filepath] = {}
-            end
-            -- Here, we assume line numbers correspond; adjust as needed
-            if mapping.line > 0 then
-                M.modified_files[mapping.filepath][mapping.line] = line
+            if not clangd_client then
+                vim.notify("clangd LSP client not found.", vim.log.levels.ERROR)
             else
-                -- Handle lines with line_num = 0 if necessary
+                vim.lsp.buf_attach_client(M.virtual_buffer, clangd_client.id)
             end
-        end
-    end
+
+            -- Set up buffer change tracking using nvim_buf_attach
+            api.nvim_buf_attach(M.virtual_buffer, false, {
+                on_lines = function(_, buf, changedtick, firstline, lastline, new_lastline, bytecount)
+                    -- Map changes back to original files
+                    for i = firstline + 1, new_lastline do
+                        local mapping = M.line_mapping[i]
+                        if mapping then
+                            local line = api.nvim_buf_get_lines(buf, i - 1, i, false)[1]
+                            if not M.modified_files[mapping.filepath] then
+                                M.modified_files[mapping.filepath] = {}
+                            end
+                            M.modified_files[mapping.filepath][mapping.line] = line
+                        end
+                    end
+                end,
+                on_detach = function()
+                    -- Cleanup if needed
+                end,
+            })
+
+            -- Provide user feedback
+            vim.notify("Unfurled includes in " .. filepath, vim.log.levels.INFO)
+        end)
+    end)
 end
 
 -- Function to save all modified files
 function M.save_all()
     for filepath, lines in pairs(M.modified_files) do
         local original_content = {}
-        local content = read_file(filepath)
-        if content then
-            for line in content:gmatch("([^\n]*)\n?") do
+        local f = io.open(filepath, "r")
+        if f then
+            for line in f:lines() do
                 table.insert(original_content, line)
             end
+            f:close()
             -- Apply modifications
             for line_num, new_line in pairs(lines) do
-                if original_content[line_num] then
-                    original_content[line_num] = new_line
-                else
-                    original_content[line_num] = new_line
-                end
+                original_content[line_num] = new_line
             end
             -- Write back to file
-            write_file(filepath, table.concat(original_content, "\n"))
-            vim.notify("Saved changes to " .. filepath, vim.log.levels.INFO)
+            local f_write = io.open(filepath, "w")
+            if f_write then
+                f_write:write(table.concat(original_content, "\n"))
+                f_write:close()
+                vim.notify("Saved changes to " .. filepath, vim.log.levels.INFO)
+            else
+                vim.notify("Failed to write to " .. filepath, vim.log.levels.ERROR)
+            end
         else
-            vim.notify("Failed to read " .. filepath .. " for saving.", vim.log.levels.ERROR)
+            vim.notify("Failed to read " .. filepath, vim.log.levels.ERROR)
         end
     end
     vim.notify("All changes saved.", vim.log.levels.INFO)
@@ -293,13 +321,6 @@ function M.setup()
     api.nvim_create_user_command('UnfurlSave', function()
         M.save_all()
     end, {})
-
-    -- Autocmd to handle buffer changes
-    api.nvim_create_autocmd({"TextChanged", "TextChangedI"}, {
-        callback = function(args)
-            on_virtual_buf_change(args.buf, args.changedtick)
-        end
-    })
 end
 
 return M
